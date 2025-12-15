@@ -1,0 +1,489 @@
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+const fs = require('fs');
+
+const dbPath = path.join(__dirname, 'inventory.db');
+let db = null;
+
+const getDatabase = () => {
+  if (db) return db;
+  
+  db = new sqlite3.Database(dbPath, (err) => {
+    if (err) {
+      console.error('数据库连接失败:', err.message);
+    } else {
+      console.log('已连接到SQLite数据库');
+    }
+  });
+  
+  return db;
+};
+
+const initDatabase = () => {
+  const database = getDatabase();
+  
+  database.serialize(() => {
+    database.run(`
+      CREATE TABLE IF NOT EXISTS inventory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bill_number TEXT NOT NULL,
+        batch_number TEXT NOT NULL,
+        quantity REAL NOT NULL DEFAULT 0,
+        weight REAL NOT NULL DEFAULT 0,
+        product_name TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `, (err) => {
+      if (err) console.error('创建inventory表失败:', err.message);
+    });
+
+    database.run(`
+      CREATE TABLE IF NOT EXISTS inbound_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bill_number TEXT NOT NULL,
+        batch_number TEXT NOT NULL,
+        quantity REAL NOT NULL,
+        weight REAL NOT NULL,
+        product_name TEXT,
+        inbound_date DATE DEFAULT (date('now', '+8 hours')),
+        arrival_date DATE,
+        charge_date DATE,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `, (err) => {
+      if (err) console.error('创建inbound_records表失败:', err.message);
+      else {
+        // 尝试添加字段以兼容旧表结构 (忽略重复列错误)
+        database.run(`ALTER TABLE inbound_records ADD COLUMN arrival_date DATE`, () => {});
+        database.run(`ALTER TABLE inbound_records ADD COLUMN charge_date DATE`, () => {});
+      }
+    });
+
+    database.run(`
+      CREATE TABLE IF NOT EXISTS outbound_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bill_number TEXT NOT NULL,
+        batch_number TEXT NOT NULL,
+        quantity REAL NOT NULL,
+        weight REAL NOT NULL,
+        product_name TEXT,
+        customer_name TEXT NOT NULL,
+        destination TEXT,
+        outbound_date DATE DEFAULT (date('now', '+8 hours')),
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `, (err) => {
+      if (err) console.error('创建outbound_records表失败:', err.message);
+    });
+  });
+};
+
+const runQuery = (sql, params = []) => {
+  return new Promise((resolve, reject) => {
+    const database = getDatabase();
+    database.run(sql, params, function(err) {
+      if (err) {
+        console.error('数据库执行失败:', err.message);
+        reject(err);
+      } else {
+        resolve({ id: this.lastID, changes: this.changes });
+      }
+    });
+  });
+};
+
+const getQuery = (sql, params = []) => {
+  return new Promise((resolve, reject) => {
+    const database = getDatabase();
+    database.get(sql, params, (err, row) => {
+      if (err) {
+        console.error('数据库查询失败:', err.message);
+        reject(err);
+      } else {
+        resolve(row);
+      }
+    });
+  });
+};
+
+const allQuery = (sql, params = []) => {
+  return new Promise((resolve, reject) => {
+    const database = getDatabase();
+    database.all(sql, params, (err, rows) => {
+      if (err) {
+        console.error('数据库查询失败:', err.message);
+        reject(err);
+      } else {
+        resolve(rows || []);
+      }
+    });
+  });
+};
+
+const addInboundRecord = async (data) => {
+  try {
+    const { bill_number, batch_number, quantity, weight, product_name, arrival_date, charge_date } = data;
+    
+    await runQuery(`
+      INSERT INTO inbound_records (bill_number, batch_number, quantity, weight, product_name, arrival_date, charge_date)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [bill_number, batch_number, quantity, weight, product_name, arrival_date, charge_date]);
+
+    const existingInventory = await getQuery(
+      'SELECT * FROM inventory WHERE bill_number = ? AND batch_number = ?',
+      [bill_number, batch_number]
+    );
+
+    if (existingInventory) {
+      await runQuery(`
+        UPDATE inventory 
+        SET quantity = quantity + ?, weight = weight + ?, updated_at = CURRENT_TIMESTAMP
+        WHERE bill_number = ? AND batch_number = ?
+      `, [quantity, weight, bill_number, batch_number]);
+    } else {
+      await runQuery(`
+        INSERT INTO inventory (bill_number, batch_number, quantity, weight, product_name)
+        VALUES (?, ?, ?, ?, ?)
+      `, [bill_number, batch_number, quantity, weight, product_name]);
+    }
+
+    return { success: true };
+  } catch (err) {
+    throw err;
+  }
+};
+
+const addOutboundRecord = async (data) => {
+  try {
+    const { bill_number, batch_number, quantity, weight, product_name, customer_name, destination } = data;
+
+    const inventory = await getQuery(
+      'SELECT * FROM inventory WHERE bill_number = ? AND batch_number = ?',
+      [bill_number, batch_number]
+    );
+
+    if (!inventory || inventory.quantity < quantity) {
+      throw new Error('库存不足');
+    }
+
+    await runQuery(`
+      INSERT INTO outbound_records (bill_number, batch_number, quantity, weight, product_name, customer_name, destination)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [bill_number, batch_number, quantity, weight, product_name, customer_name, destination]);
+
+    await runQuery(`
+      UPDATE inventory 
+      SET quantity = quantity - ?, weight = weight - ?, updated_at = CURRENT_TIMESTAMP
+      WHERE bill_number = ? AND batch_number = ?
+    `, [quantity, weight, bill_number, batch_number]);
+
+    return { success: true };
+  } catch (err) {
+    throw err;
+  }
+};
+
+const getInventorySummary = async () => {
+  try {
+    // 查询库存数据，并关联最新入库记录的到港时间和收费时间
+    const inventory = await allQuery(`
+      SELECT 
+        i.*,
+        (
+          SELECT arrival_date 
+          FROM inbound_records ir 
+          WHERE ir.bill_number = i.bill_number 
+            AND ir.batch_number = i.batch_number 
+          ORDER BY ir.created_at DESC 
+          LIMIT 1
+        ) as arrival_date,
+        (
+          SELECT charge_date 
+          FROM inbound_records ir 
+          WHERE ir.bill_number = i.bill_number 
+            AND ir.batch_number = i.batch_number 
+          ORDER BY ir.created_at DESC 
+          LIMIT 1
+        ) as charge_date
+      FROM inventory i
+      WHERE i.quantity > 0
+      ORDER BY i.created_at DESC
+    `);
+    
+    const totalQuantity = await getQuery('SELECT SUM(quantity) as total FROM inventory');
+    const totalWeight = await getQuery('SELECT SUM(weight) as total FROM inventory');
+    
+    return {
+      inventory,
+      totalQuantity: totalQuantity?.total || 0,
+      totalWeight: totalWeight?.total || 0
+    };
+  } catch (err) {
+    throw err;
+  }
+};
+
+const getTodayInbound = async () => {
+  try {
+    const records = await allQuery(
+      "SELECT * FROM inbound_records WHERE inbound_date = date('now', '+8 hours') ORDER BY created_at DESC"
+    );
+    return records;
+  } catch (err) {
+    throw err;
+  }
+};
+
+const getTodayOutbound = async () => {
+  try {
+    const records = await allQuery(
+      `SELECT 
+        o.*,
+        (
+          SELECT arrival_date 
+          FROM inbound_records ir 
+          WHERE ir.bill_number = o.bill_number 
+            AND ir.batch_number = o.batch_number 
+          ORDER BY ir.created_at DESC 
+          LIMIT 1
+        ) as arrival_date,
+        (
+          SELECT charge_date 
+          FROM inbound_records ir 
+          WHERE ir.bill_number = o.bill_number 
+            AND ir.batch_number = o.batch_number 
+          ORDER BY ir.created_at DESC 
+          LIMIT 1
+        ) as charge_date,
+        (
+          SELECT 
+            CAST(julianday(o.outbound_date) - julianday(ir.charge_date) + 1 AS INTEGER)
+          FROM inbound_records ir 
+          WHERE ir.bill_number = o.bill_number 
+            AND ir.batch_number = o.batch_number 
+            AND ir.charge_date IS NOT NULL
+          ORDER BY ir.created_at DESC 
+          LIMIT 1
+        ) as storage_days
+      FROM outbound_records o
+      WHERE o.outbound_date = date('now', '+8 hours') 
+      ORDER BY o.created_at DESC`
+    );
+    return records;
+  } catch (err) {
+    throw err;
+  }
+};
+
+const updateInventory = async (id, data) => {
+  try {
+    const { bill_number, batch_number, quantity, weight, product_name } = data;
+    
+    const result = await runQuery(`
+      UPDATE inventory 
+      SET bill_number = ?, batch_number = ?, quantity = ?, weight = ?, product_name = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `, [bill_number, batch_number, quantity, weight, product_name, id]);
+
+    if (result.changes === 0) {
+      throw new Error('记录不存在或未更新');
+    }
+
+    return { success: true };
+  } catch (err) {
+    throw err;
+  }
+};
+
+const deleteInventory = async (id) => {
+  try {
+    const result = await runQuery('DELETE FROM inventory WHERE id = ?', [id]);
+    
+    if (result.changes === 0) {
+      throw new Error('记录不存在或已删除');
+    }
+
+    return { success: true };
+  } catch (err) {
+    throw err;
+  }
+};
+
+const updateInboundRecord = async (id, data) => {
+  try {
+    const { bill_number, batch_number, quantity, weight, product_name, arrival_date, charge_date } = data;
+    
+    const oldRecord = await getQuery('SELECT * FROM inbound_records WHERE id = ?', [id]);
+    if (!oldRecord) throw new Error('记录不存在');
+
+    // 1. 回滚旧库存：减去旧的数量/重量
+    await runQuery(`
+      UPDATE inventory 
+      SET quantity = quantity - ?, weight = weight - ?, updated_at = CURRENT_TIMESTAMP
+      WHERE bill_number = ? AND batch_number = ?
+    `, [oldRecord.quantity, oldRecord.weight, oldRecord.bill_number, oldRecord.batch_number]);
+
+    // 2. 更新入库记录（包含新增的时间字段）
+    await runQuery(`
+      UPDATE inbound_records 
+      SET bill_number = ?, batch_number = ?, quantity = ?, weight = ?, product_name = ?, arrival_date = ?, charge_date = ?
+      WHERE id = ?
+    `, [bill_number, batch_number, quantity, weight, product_name, arrival_date, charge_date, id]);
+
+    // 3. 应用新库存：增加新的数量/重量（使用新的提单号和批号）
+    const existingInventory = await getQuery(
+      'SELECT * FROM inventory WHERE bill_number = ? AND batch_number = ?',
+      [bill_number, batch_number]
+    );
+
+    if (existingInventory) {
+      await runQuery(`
+        UPDATE inventory 
+        SET quantity = quantity + ?, weight = weight + ?, updated_at = CURRENT_TIMESTAMP
+        WHERE bill_number = ? AND batch_number = ?
+      `, [quantity, weight, bill_number, batch_number]);
+    } else {
+      await runQuery(`
+        INSERT INTO inventory (bill_number, batch_number, quantity, weight, product_name)
+        VALUES (?, ?, ?, ?, ?)
+      `, [bill_number, batch_number, quantity, weight, product_name]);
+    }
+
+    return { success: true };
+  } catch (err) {
+    throw err;
+  }
+};
+
+const deleteInboundRecord = async (id) => {
+  try {
+    const oldRecord = await getQuery('SELECT * FROM inbound_records WHERE id = ?', [id]);
+    if (!oldRecord) throw new Error('记录不存在');
+
+    await runQuery(`
+      UPDATE inventory 
+      SET quantity = quantity - ?, weight = weight - ?, updated_at = CURRENT_TIMESTAMP
+      WHERE bill_number = ? AND batch_number = ?
+    `, [oldRecord.quantity, oldRecord.weight, oldRecord.bill_number, oldRecord.batch_number]);
+
+    await runQuery('DELETE FROM inbound_records WHERE id = ?', [id]);
+
+    return { success: true };
+  } catch (err) {
+    throw err;
+  }
+};
+
+const updateOutboundRecord = async (id, data) => {
+  try {
+    const { bill_number, batch_number, quantity, weight, product_name, customer_name, destination } = data;
+
+    const oldRecord = await getQuery('SELECT * FROM outbound_records WHERE id = ?', [id]);
+    if (!oldRecord) throw new Error('记录不存在');
+
+    // 回滚出库前的库存状态（加回原来的数量）
+    await runQuery(`
+      UPDATE inventory 
+      SET quantity = quantity + ?, weight = weight + ?, updated_at = CURRENT_TIMESTAMP
+      WHERE bill_number = ? AND batch_number = ?
+    `, [oldRecord.quantity, oldRecord.weight, oldRecord.bill_number, oldRecord.batch_number]);
+
+    // 更新出库记录
+    await runQuery(`
+      UPDATE outbound_records 
+      SET bill_number = ?, batch_number = ?, quantity = ?, weight = ?, product_name = ?, customer_name = ?, destination = ?
+      WHERE id = ?
+    `, [bill_number, batch_number, quantity, weight, product_name, customer_name, destination, id]);
+
+    // 再次执行出库（减去新的数量）
+    await runQuery(`
+      UPDATE inventory 
+      SET quantity = quantity - ?, weight = weight - ?, updated_at = CURRENT_TIMESTAMP
+      WHERE bill_number = ? AND batch_number = ?
+    `, [quantity, weight, bill_number, batch_number]);
+
+    return { success: true };
+  } catch (err) {
+    throw err;
+  }
+};
+
+const deleteOutboundRecord = async (id) => {
+  try {
+    const oldRecord = await getQuery('SELECT * FROM outbound_records WHERE id = ?', [id]);
+    if (!oldRecord) throw new Error('记录不存在');
+
+    await runQuery(`
+      UPDATE inventory 
+      SET quantity = quantity + ?, weight = weight + ?, updated_at = CURRENT_TIMESTAMP
+      WHERE bill_number = ? AND batch_number = ?
+    `, [oldRecord.quantity, oldRecord.weight, oldRecord.bill_number, oldRecord.batch_number]);
+
+    await runQuery('DELETE FROM outbound_records WHERE id = ?', [id]);
+
+    return { success: true };
+  } catch (err) {
+    throw err;
+  }
+};
+
+// --- 新增: 统计分析功能 ---
+
+const getAnnualInboundTotal = async () => {
+  try {
+    const currentYear = new Date().getFullYear().toString();
+    const result = await getQuery(
+      `SELECT SUM(quantity) as total_quantity, SUM(weight) as total_weight 
+       FROM inbound_records 
+       WHERE strftime('%Y', inbound_date) = ?`,
+      [currentYear]
+    );
+    return {
+      year: currentYear,
+      totalQuantity: result?.total_quantity || 0,
+      totalWeight: result?.total_weight || 0
+    };
+  } catch (err) {
+    throw err;
+  }
+};
+
+const getCustomerOutboundStats = async () => {
+  try {
+    const result = await allQuery(
+      `SELECT 
+        customer_name, 
+        SUM(quantity) as total_quantity, 
+        SUM(weight) as total_weight,
+        COUNT(*) as record_count
+       FROM outbound_records 
+       GROUP BY customer_name 
+       ORDER BY total_quantity DESC`
+    );
+    return result;
+  } catch (err) {
+    throw err;
+  }
+};
+
+module.exports = {
+  initDatabase,
+  getDatabase,
+  runQuery,
+  getQuery,
+  allQuery,
+  addInboundRecord,
+  addOutboundRecord,
+  getInventorySummary,
+  getTodayInbound,
+  getTodayOutbound,
+  updateInventory,
+  deleteInventory,
+  updateInboundRecord,
+  deleteInboundRecord,
+  updateOutboundRecord,
+  deleteOutboundRecord,
+  getAnnualInboundTotal,
+  getCustomerOutboundStats
+};
